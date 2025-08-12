@@ -40,10 +40,10 @@ RE_NEXT_SECTION = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", fl
 RE_DIMENSION = re.compile(r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+?)\s*$", flags=re.MULTILINE)
 RE_TABLE_HEADER = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
-# Allow two or three digits
+# Codes can be 2 or 3 digits; require whitespace before the rest
 RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>.+)$")
 
-# Amount patterns
+# Amount patterns (EUR optional)
 RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 
@@ -58,6 +58,7 @@ def _norm_amount(s: str) -> float:
         return float("nan")
 
 def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
+    """Locate target sections and slice their text."""
     blocks: List[Dict[str, str]] = []
     starts = list(RE_BLOCK_START.finditer(full_text))
     if not starts:
@@ -75,14 +76,22 @@ def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
     return blocks
 
 def _split_parts_by_slash(s: str) -> List[str]:
+    # Normalise non-breaking spaces and split by ASCII slash only
     s = s.replace("\u00A0", " ")
     return [p.strip() for p in s.split("/") if p.strip()]
 
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
+    """
+    Robust context:
+      - Split by '/'
+      - Stitch next line only if needed
+      - Scope = "" when missing (3-part case)
+    """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": ""}
 
     lines = [ln.strip().replace("\u00A0", " ") for ln in block_text.splitlines() if ln.strip()]
 
+    # Find the first line containing "Priorität"
     idx = None
     for i, ln in enumerate(lines):
         if "Priorität" in ln:
@@ -94,12 +103,14 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     candidate = lines[idx]
     parts = _split_parts_by_slash(candidate)
 
+    # Stitch next line if we still have <3 parts and the next line looks like continuation
     if len(parts) < 3 and idx + 1 < len(lines):
         nxt = lines[idx + 1]
         if not re.match(r"^(Tabelle|Dimension|Code)\b", nxt):
             candidate = candidate + " / " + nxt
             parts = _split_parts_by_slash(candidate)
 
+    # Extract values
     if len(parts) >= 2:
         m = re.search(r"Priorität\s+(.+)", parts[0], flags=re.IGNORECASE)
         if m:
@@ -153,10 +164,10 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         local_end = next_dim.start() if next_dim else len(block_text)
         local_text = block_text[dim_start:local_end]
 
+        # ✅ Parse rows only if the standard table header is present
         th = RE_TABLE_HEADER.search(local_text)
         if not th:
-            # 🚫 No table header -> skip to avoid false positives
-            continue
+            continue  # avoid false positives in narrative text
         local_start = th.end()
 
         snippet = local_text[local_start:].strip("\n")
@@ -191,12 +202,14 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         while i < len(lines):
             ln = lines[i]
 
+            # New code row => boundary for previous row
             mcode = RE_CODE_LINE.match(ln)
             if mcode:
                 emit_if_complete()
                 current_code = mcode.group("code")
                 rest = mcode.group("rest").strip()
 
+                # If amount is on the same line, store it but DO NOT emit yet
                 trailing = RE_AMOUNT_TRAILING.search(rest)
                 if trailing:
                     pending_amount = trailing.group("amt")
@@ -208,21 +221,25 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
                 i += 1
                 continue
 
+            # Amount-only line => remember; do not emit yet
             mamt = RE_AMOUNT_ONLY.match(ln)
             if mamt and current_code is not None:
                 pending_amount = mamt.group("amt")
                 i += 1
                 continue
 
+            # New header/table marker => boundary
             if _looks_like_new_table_marker(ln):
                 emit_if_complete()
                 i += 1
                 continue
 
+            # Otherwise it's a wrapped Beschreibung line
             if current_code is not None:
                 current_desc_parts.append(ln.strip())
             i += 1
 
+        # End of this table: flush last row if complete
         emit_if_complete()
 
     return rows
