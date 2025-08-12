@@ -14,8 +14,8 @@ st.sidebar.markdown(
     """
 1. **Upload** one or more programme PDFs.
 2. Click **Parse PDFs** to extract rows.
-3. Use the **Keep** checkboxes to choose rows to export.
-4. Optionally **sort** the preview (and export) using the controls below.
+3. Use the **Keep** checkboxes to choose rows for export.
+4. Optionally **sort** the preview and export using the controls below.
 5. Click **Download Excel** to export your selection.
     """
 )
@@ -41,8 +41,7 @@ def _parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> p
     if not all_rows:
         return pd.DataFrame()
     out = pd.concat(all_rows, ignore_index=True)
-    # Default selection = keep all
-    out.insert(0, "Keep", True)
+    out.insert(0, "Keep", True)  # default keep all
     return out
 
 if parse_clicked:
@@ -52,40 +51,65 @@ if parse_clicked:
     if df is None or df.empty:
         st.info("No rows extracted. Please verify the PDFs contain the expected sections.")
     else:
+        # ---------- SORTING CONTROLS ----------
         st.subheader("Sorting")
-        st.write("You can also click column headers in the table to sort interactively. "
-                 "Use the controls below for reproducible, multi-column sorting (and to apply sorting to the export).")
+        st.write("Click column headers in the table to sort ad-hoc, or use these controls for reproducible multi-column sorting.")
 
-        # Build choices excluding the checkbox column
         sortable_cols = [c for c in df.columns if c != "Keep"]
 
-        # Multi-column selection
+        # Remember sort columns in session
         sort_cols = st.multiselect(
             "Sort by column(s)",
             options=sortable_cols,
-            default=["Indikative Aufschlüsselung (Section)", "Dimension", "Code"]
-            if {"Indikative Aufschlüsselung (Section)", "Dimension", "Code"}.issubset(df.columns)
-            else []
+            default=st.session_state.get("sort_cols", [])
         )
+        st.session_state.sort_cols = sort_cols
 
-        # Direction per selected column
+        # Initialise sort directions if not present
+        if "sort_dirs" not in st.session_state:
+            st.session_state.sort_dirs = {}
+
+        # Add missing sort_dirs entries for new columns
+        for col in sort_cols:
+            if col not in st.session_state.sort_dirs:
+                st.session_state.sort_dirs[col] = True  # default ascending
+
+        # Remove directions for deselected columns
+        for col in list(st.session_state.sort_dirs.keys()):
+            if col not in sort_cols:
+                del st.session_state.sort_dirs[col]
+
+        # Always render toggle area if sort_cols is not empty
         sort_dirs = []
         if sort_cols:
             st_cols = st.columns(len(sort_cols))
             for i, col in enumerate(sort_cols):
                 with st_cols[i]:
-                    asc = st.toggle(f"↑ Asc for “{col}”", value=True, key=f"asc_{col}")
-                    sort_dirs.append(asc)
+                    st.session_state.sort_dirs[col] = st.toggle(
+                        f"↑ Asc for “{col}”",
+                        value=st.session_state.sort_dirs[col],
+                        key=f"asc_{col}"
+                    )
+                    sort_dirs.append(st.session_state.sort_dirs[col])
 
-        apply_sort_to_export = st.checkbox("Apply sorting to exported Excel", value=True)
+        apply_sort_to_export = st.checkbox(
+            "Apply sorting to exported Excel",
+            value=st.session_state.get("apply_sort_to_export", True)
+        )
+        st.session_state.apply_sort_to_export = apply_sort_to_export
 
-        # Apply deterministic sorting for preview (stable)
+        # ---------- PREVIEW ----------
         preview_df = df.copy()
         if sort_cols:
-            preview_df = preview_df.sort_values(by=sort_cols, ascending=sort_dirs, kind="stable", ignore_index=True)
+            preview_df = preview_df.sort_values(
+                by=sort_cols,
+                ascending=sort_dirs,
+                kind="stable",
+                ignore_index=True
+            )
 
         st.subheader("Preview & Select")
-        st.write("Use the **Keep** column to select rows for export. You can still click column headers to sort ad-hoc.")
+        st.write("Use the **Keep** column to select rows for export.")
 
         edited = st.data_editor(
             preview_df,
@@ -99,14 +123,17 @@ if parse_clicked:
             }
         )
 
-        # Build export DataFrame
+        # ---------- EXPORT ----------
         to_export = edited[edited["Keep"] == True].drop(columns=["Keep"]) if "Keep" in edited.columns else edited
         if apply_sort_to_export and sort_cols:
-            # Ensure export respects the selected order
-            # (Use the edited columns to preserve any in-grid edits)
             valid_sort_cols = [c for c in sort_cols if c in to_export.columns]
             if valid_sort_cols:
-                to_export = to_export.sort_values(by=valid_sort_cols, ascending=sort_dirs, kind="stable", ignore_index=True)
+                to_export = to_export.sort_values(
+                    by=valid_sort_cols,
+                    ascending=[st.session_state.sort_dirs[c] for c in valid_sort_cols],
+                    kind="stable",
+                    ignore_index=True
+                )
 
         st.divider()
         st.subheader("Export")
@@ -126,3 +153,4 @@ if parse_clicked:
             )
 else:
     st.info("Upload one or more PDFs, then click **Parse PDFs**.")
+
