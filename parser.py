@@ -205,4 +205,28 @@ def parse_pdf_text(full_text: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    ord
+    ordered_cols = [
+        "Indikative Aufschlüsselung (Section)",
+        "Priorität",
+        "Spezifisches Ziel",
+        "Funding Programme",
+        "Scope",
+        "Dimension",
+        "Code",
+        "Beschreibung",
+        "Betrag (EUR)",
+    ]
+    for c in ordered_cols:
+        if c not in df.columns:
+            df[c] = None
+    df = df[ordered_cols]
+    return df
+
+def parse_pdf_filelike(file_like) -> pd.DataFrame:
+    if hasattr(file_like, "seek"):
+        try:
+            file_like.seek(0)
+        except Exception:
+            pass
+    text = _pdf_to_text(file_like)
+    return parse_pdf_text(text)
