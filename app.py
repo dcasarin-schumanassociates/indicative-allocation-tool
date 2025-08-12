@@ -28,7 +28,6 @@ uploaded_files = st.file_uploader(
 
 parse_clicked = st.button("Parse PDFs", type="primary", disabled=(len(uploaded_files) == 0))
 
-@st.cache_data(show_spinner=False)
 def _parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> pd.DataFrame:
     all_rows = []
     for f in files:
@@ -87,4 +86,3 @@ if parse_clicked:
             )
 else:
     st.info("Upload one or more PDFs, then click **Parse PDFs**.")
-
