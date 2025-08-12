@@ -38,21 +38,16 @@ RE_BLOCK_START = re.compile(
 RE_NEXT_SECTION = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", flags=re.MULTILINE)
 
 RE_DIMENSION = re.compile(r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+?)\s*$", flags=re.MULTILINE)
+RE_TABLE_HEADER = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
-# Table headers:
-RE_TABLE_HEADER_3 = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
-RE_TABLE_HEADER_2 = re.compile(r"^\s*Code\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
-# Heuristic: any header line that contains both "Code" and "Betrag"
-RE_TABLE_HEADER_ANY = re.compile(r"^\s*Code\b.*\bBetrag\b.*$", flags=re.MULTILINE | re.IGNORECASE)
-
-# Allow 2–3 digit codes; description must begin with a letter or "(" (filters "90 %")
+# ✅ Allow 2–3 digit codes; require description to start with a letter or "("
 RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>[A-Za-zÄÖÜäöüß(].+)$")
 
 # Amounts (amount-only line, or trailing at end of line)
 RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 
-# Inline section header (to cut dimension scan if a new section starts)
+# Section header inside a block (to stop table scan if another section starts)
 RE_SECTION_HEADER_INLINE = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", flags=re.MULTILINE)
 
 # --- Helpers -----------------------------------------------------------------
@@ -64,10 +59,6 @@ def _norm_amount(s: str) -> float:
         return float(s)
     except ValueError:
         return float("nan")
-
-def _is_page_number_line(s: str) -> bool:
-    # Pure page number like "56"
-    return bool(re.fullmatch(r"\d{1,4}", s.strip()))
 
 def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
     blocks: List[Dict[str, str]] = []
@@ -91,12 +82,6 @@ def _split_parts_by_slash(s: str) -> List[str]:
     return [p.strip() for p in s.split("/") if p.strip()]
 
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
-    """
-    Robust context:
-      - Split by '/'
-      - Stitch next line only if needed
-      - Scope = "" when missing (3-part case)
-    """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": ""}
 
     lines = [ln.strip().replace("\u00A0", " ") for ln in block_text.splitlines() if ln.strip()]
@@ -157,7 +142,7 @@ def _join_desc_parts(parts: List[str]) -> str:
     return re.sub(r"\s{2,}", " ", out).strip()
 
 def _looks_like_new_table_marker(s: str) -> bool:
-    return bool(re.match(r"^\s*(Tabelle\s+\d+|Dimension\s+\d+|Code\b.*Betrag|Code\s+Beschreibung\s+Betrag)", s, flags=re.IGNORECASE))
+    return bool(re.match(r"^\s*(Tabelle\s+\d+|Dimension\s+\d+|Code\s+Beschreibung\s+Betrag)", s))
 
 # --- Row extraction -----------------------------------------------------------
 
@@ -176,47 +161,24 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         local_end = min(cut_points) if cut_points else len(block_text)
         local_text = block_text[dim_start:local_end]
 
-        # 1) Prefer explicit headers
-        header_match = RE_TABLE_HEADER_3.search(local_text) or RE_TABLE_HEADER_2.search(local_text) or RE_TABLE_HEADER_ANY.search(local_text)
-        if header_match:
-            local_start = header_match.end()
-        else:
-            # 2) Fallback: start at first code line that has an amount within the next few lines
-            m_any_code = RE_CODE_LINE.search(local_text)
-            if not m_any_code:
-                continue
-            # lookahead window for amount
-            after = local_text[m_any_code.start():]
-            lines_tmp = [ln.strip() for ln in after.splitlines() if ln.strip()]
-            has_amount_nearby = False
-            for k in range(min(10, len(lines_tmp))):
-                ln_k = lines_tmp[k]
-                if RE_AMOUNT_TRAILING.search(ln_k) or RE_AMOUNT_ONLY.match(ln_k):
-                    amt = (RE_AMOUNT_TRAILING.search(ln_k) or RE_AMOUNT_ONLY.match(ln_k)).group("amt")
-                    if "." in amt or "," in amt:
-                        has_amount_nearby = True
-                        break
-                if _looks_like_new_table_marker(ln_k):
-                    break
-            if not has_amount_nearby:
-                continue
-            # start parsing from that code line
-            local_start = m_any_code.start()
+        # ✅ Checker step: only parse if header "Code Beschreibung Betrag (EUR)" exists
+        th = RE_TABLE_HEADER.search(local_text)
+        if not th:
+            continue
+        local_start = th.end()
 
         snippet = local_text[local_start:].strip("\n")
         if not snippet:
             continue
 
-        # Lines within the table; keep non-empty but skip page numbers
-        raw_lines = [ln.rstrip() for ln in snippet.splitlines() if ln.strip() != ""]
-        lines = [ln for ln in raw_lines if not _is_page_number_line(ln)]
+        lines = [ln.rstrip() for ln in snippet.splitlines() if ln.strip() != ""]
         i = 0
 
         current_code = None
         current_desc_parts: List[str] = []
         pending_amount: Optional[str] = None
 
-        def emit_now():
+        def emit_if_complete():
             nonlocal current_code, current_desc_parts, pending_amount
             if current_code is not None and pending_amount is not None:
                 rows.append({
@@ -237,64 +199,59 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         while i < len(lines):
             ln = lines[i]
 
-            # New code row?
+            # New code row? (guarded to start with a letter/"(" after the number)
             mcode = RE_CODE_LINE.match(ln)
             if mcode:
-                # If we had a complete row already, flush
-                if current_code is not None and pending_amount is not None:
-                    emit_now()
-                # Start new row
+                # 🔎 Look-ahead: ensure an amount occurs soon (within next ~8 lines)
+                lookahead_has_amount = False
+                for j in range(i, min(i + 9, len(lines))):
+                    if RE_AMOUNT_TRAILING.search(lines[j]) or RE_AMOUNT_ONLY.match(lines[j]):
+                        lookahead_has_amount = True
+                        break
+                    if _looks_like_new_table_marker(lines[j]) or RE_CODE_LINE.match(lines[j]):
+                        break
+                if not lookahead_has_amount:
+                    # Probably narrative numbers like "90 %" -> skip
+                    i += 1
+                    continue
+
+                # boundary for previous row
+                emit_if_complete()
+
                 current_code = mcode.group("code")
                 rest = mcode.group("rest").strip()
 
-                # Amount on same line? -> capture & EMIT IMMEDIATELY
                 trailing = RE_AMOUNT_TRAILING.search(rest)
                 if trailing:
-                    amt = trailing.group("amt")
-                    if "." in amt or "," in amt:
-                        pending_amount = amt
-                        desc_part = rest[: trailing.start()].strip()
-                        current_desc_parts = [desc_part] if desc_part else []
-                        emit_now()  # immediate emit avoids over-capturing after the amount
-                    else:
-                        # Not a real amount
-                        pending_amount = None
-                        current_desc_parts = [rest] if rest else []
+                    pending_amount = trailing.group("amt")
+                    desc_part = rest[: trailing.start()].strip()
+                    current_desc_parts = [desc_part] if desc_part else []
                 else:
                     current_desc_parts = [rest] if rest else []
                     pending_amount = None
                 i += 1
                 continue
 
-            # Amount-only line -> capture & EMIT IMMEDIATELY
+            # Amount-only line => remember; do not emit yet
             mamt = RE_AMOUNT_ONLY.match(ln)
             if mamt and current_code is not None:
-                amt = mamt.group("amt")
-                if "." in amt or "," in amt:
-                    pending_amount = amt
-                    emit_now()
+                pending_amount = mamt.group("amt")
                 i += 1
                 continue
 
-            # New header/table marker or next section => boundary (emit if complete)
-            if _looks_like_new_table_marker(ln) or RE_SECTION_HEADER_INLINE.match(ln):
-                if current_code is not None and pending_amount is not None:
-                    emit_now()
-                else:
-                    # incomplete row -> drop
-                    current_code = None
-                    current_desc_parts = []
-                    pending_amount = None
+            # New header/table marker => boundary
+            if _looks_like_new_table_marker(ln):
+                emit_if_complete()
                 i += 1
                 continue
 
-            # Otherwise continuation of Beschreibung
+            # Otherwise it's a wrapped Beschreibung line
             if current_code is not None:
                 current_desc_parts.append(ln.strip())
             i += 1
 
-        # End of this table: nothing to do (we already emitted at amount)
-        # If there is an incomplete row, we drop it silently.
+        # End of this table: flush last row if complete
+        emit_if_complete()
 
     return rows
 
@@ -331,4 +288,3 @@ def parse_pdf_filelike(file_like) -> pd.DataFrame:
             pass
     text = _pdf_to_text(file_like)
     return parse_pdf_text(text)
-
