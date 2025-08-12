@@ -103,54 +103,75 @@ def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
         blocks.append({"section": section_id, "text": block_text})
     return blocks
 
+def _norm_ws(s: str) -> str:
+    """Unicode-normalise and collapse whitespace and separators like NBSP."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u00A0", " ").replace("\u202F", " ").replace("\u2009", " ")
+    # collapse multiple spaces
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
+
+# A single, lenient pattern that captures up to four slash-separated parts on one or two lines.
+# Examples it accepts:
+#   Priorität 1 / Spezifisches Ziel 1.2 / EFRE / Übergangsregion
+#   Priorität 6 / Spezifisches Ziel JTF / Fonds JTF
+RE_CONTEXT_LINE = re.compile(
+    r"""
+    Priorität\s+(?P<prio>\d+)\s*
+    /\s*Spezifisches\s+Ziel\s+(?P<ziel>[0-9A-Za-zÄÖÜäöüß\.\-]+)\s*
+    (?:/\s*(?P<funding>[^/\n]+?)\s*)?
+    (?:/\s*(?P<scope>[^/\n]+?)\s*)?
+    $""",
+    flags=re.IGNORECASE | re.VERBOSE
+)
+
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     """
-    Accepts:
-      - 'Priorität X / Spezifisches Ziel Y / EFRE / Übergangsregion'
-      - 'Priorität 6 / Spezifisches Ziel JTF / Fonds JTF'
-      - Handles non-breaking spaces and spaced letters (e.g. 'E F R E', 'J T F').
-    Returns empty Scope when not provided.
+    Robustly parse the context line(s). Handles:
+      - one-line 'Priorität ... / Spezifisches Ziel ... / Funding / Scope'
+      - two-line splits where 'Funding / Scope' falls to the next line
+      - missing scope (3-part format)
     """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": None}
 
-    # Search the first meaningful line containing "Priorität" (skip blank lines)
-    lines = [ln for ln in (ln.strip() for ln in block_text.splitlines()) if ln]
-    prior_line = next((ln for ln in lines if "Priorität" in ln), None)
-    if not prior_line:
+    # Prepare normalised, non-empty lines from the block
+    raw_lines = [ln for ln in block_text.splitlines()]
+    lines = [_norm_ws(ln) for ln in raw_lines if _norm_ws(ln)]
+
+    # Find the first line that contains "Priorität"
+    base_idx = next((i for i, ln in enumerate(lines) if "Priorität" in ln), None)
+    if base_idx is None:
         return ctx
 
-    # Normalise spaces in that line early
-    prior_line = _squash_spaces(prior_line)
+    # Try to match on that line; if not, try joining with the next line (continuation)
+    candidates = [lines[base_idx]]
+    if base_idx + 1 < len(lines):
+        # If next line doesn't start a table/dimension, try concatenation
+        nxt = lines[base_idx + 1]
+        if not re.match(r"^Tabelle\s+\d+\s*:", nxt, flags=re.IGNORECASE):
+            candidates.append(_norm_ws(lines[base_idx] + " / " + nxt))
 
-    # Extract Priorität
-    m_prio = RE_PRIORITAET.search(prior_line)
-    if m_prio:
-        ctx["Priorität"] = m_prio.group("prio")
+    for cand in candidates:
+        m = RE_CONTEXT_LINE.search(cand)
+        if m:
+            ctx["Priorität"] = m.group("prio")
+            ctx["Spezifisches Ziel"] = m.group("ziel")
+            funding = m.group("funding")
+            scope = m.group("scope")
+            ctx["Funding Programme"] = _norm_ws(funding) if funding else None
+            ctx["Scope"] = _norm_ws(scope) if scope else None
+            return ctx
 
-    # Extract Spezifisches Ziel
-    m_ziel = RE_SPEZIFISCHES_ZIEL.search(prior_line)
-    if m_ziel:
-        ctx["Spezifisches Ziel"] = _collapse_spaced_caps(m_ziel.group("ziel"))
-
-    # Tail after Ziel (preferred) or after Priorität (fallback)
-    tail_start = m_ziel.end() if m_ziel else (m_prio.end() if m_prio else None)
-    if tail_start is None:
-        return ctx
-
-    tail = _squash_spaces(prior_line[tail_start:])
-    tail = tail.strip(" /")
-    if not tail:
-        return ctx
-
-    # Split on slash into up to two parts (funding, scope)
-    parts = [p.strip() for p in tail.split("/") if p.strip()]
-    if len(parts) >= 1:
-        funding = _collapse_spaced_caps(parts[0])
-        ctx["Funding Programme"] = funding
-    if len(parts) >= 2:
-        scope = _collapse_spaced_caps(parts[1])
-        ctx["Scope"] = scope
-
+    # Fallback: very lenient parse to at least get prio/goal if the above fails
+    # (keeps behaviour consistent with your previous working version)
+    mprio = re.search(r"Priorität\s+(\d+)", lines[base_idx], flags=re.IGNORECASE)
+    mziel = re.search(r"Spezifisches\s+Ziel\s+([0-9A-Za-zÄÖÜäöüß\.\-]+)", lines[base_idx], flags=re.IGNORECASE)
+    if mprio:
+        ctx["Priorität"] = mprio.group(1)
+    if mziel:
+        ctx["Spezifisches Ziel"] = mziel.group(1)
     return ctx
 
 def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[str, float]]]:
