@@ -87,3 +87,4 @@ if parse_clicked:
             )
 else:
     st.info("Upload one or more PDFs, then click **Parse PDFs**.")
+
