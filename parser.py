@@ -74,18 +74,10 @@ def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
     return blocks
 
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
-    """
-    Robustly capture context, handling:
-      - Extra blank lines
-      - Line breaks within Funding/Scope
-      - 3-part (no scope) or 4-part contexts
-    """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": None}
+    lines = [ln.strip() for ln in block_text.splitlines() if ln.strip()]
 
-    # Non-empty lines for robustness
-    lines = [ln.strip() for ln in block_text.splitlines() if ln.strip() != ""]
-
-    # Find first line containing "Priorität"
+    # find line with "Priorität"
     idx = None
     for i, ln in enumerate(lines):
         if "Priorität" in ln:
@@ -94,37 +86,31 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     if idx is None:
         return ctx
 
-    # Merge consecutive lines until we have at least 3 parts split by "/"
-    candidate_parts = []
+    # merge current line + next line in case of breaks
     merged = lines[idx]
-    j = idx + 1
-    while merged.count("/") < 3 and j < len(lines):
-        merged += " / " + lines[j]
-        j += 1
+    if idx + 1 < len(lines):
+        merged += " / " + lines[idx + 1]
 
-    # Now split by "/"
-    candidate_parts = [p.strip() for p in merged.split("/") if p.strip()]
-
-    if len(candidate_parts) >= 2:
-        # Extract Priorität (first part)
-        prio_match = re.search(r"Priorität\s+(\S+)", candidate_parts[0], flags=re.IGNORECASE)
+    # split parts
+    parts = [p.strip() for p in merged.split("/") if p.strip()]
+    if len(parts) >= 2:
+        prio_match = re.search(r"Priorität\s+(.+)", parts[0], flags=re.IGNORECASE)
         if prio_match:
-            ctx["Priorität"] = prio_match.group(1)
+            ctx["Priorität"] = prio_match.group(1).strip()
 
-        # Extract Spezifisches Ziel (second part)
-        ziel_match = re.search(r"Spezifisches\s+Ziel\s+(.+)", candidate_parts[1], flags=re.IGNORECASE)
+        ziel_match = re.search(r"Spezifisches\s+Ziel\s+(.+)", parts[1], flags=re.IGNORECASE)
         if ziel_match:
-            ctx["Spezifisches Ziel"] = ziel_match.group(1)
+            ctx["Spezifisches Ziel"] = ziel_match.group(1).strip()
 
-        # Funding & Scope
-        if len(candidate_parts) >= 4:
-            ctx["Funding Programme"] = candidate_parts[2]
-            ctx["Scope"] = candidate_parts[3]
-        elif len(candidate_parts) == 3:
-            ctx["Funding Programme"] = candidate_parts[2]
-            ctx["Scope"] = None
+    if len(parts) >= 4:
+        ctx["Funding Programme"] = parts[2]
+        ctx["Scope"] = parts[3]
+    elif len(parts) == 3:
+        ctx["Funding Programme"] = parts[2]
+        ctx["Scope"] = None
 
     return ctx
+
 
 def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[str, float]]]:
     rows: List[Dict[str, Union[str, float]]] = []
