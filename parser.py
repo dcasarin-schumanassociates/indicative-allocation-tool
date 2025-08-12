@@ -3,6 +3,7 @@ from typing import List, Dict, Optional, Union
 import io
 import pandas as pd
 
+# Prefer pdfplumber; fallback to pdfminer.six
 def _pdf_to_text(file_like: Union[io.BytesIO, "UploadedFile"]) -> str:
     text_parts: List[str] = []
     try:
@@ -15,64 +16,49 @@ def _pdf_to_text(file_like: Union[io.BytesIO, "UploadedFile"]) -> str:
         try:
             from pdfminer.high_level import extract_text  # type: ignore
             if hasattr(file_like, "seek"):
-                file_like.seek(0)
+                try:
+                    file_like.seek(0)
+                except Exception:
+                    pass
             text = extract_text(file_like)
             return text or ""
         except Exception:
             return ""
     return "\n".join(text_parts)
 
-# --- Patterns --------------------------------------------------------------
+# --- Regex patterns -----------------------------------------------------------
 
 SECTION_TITLE_GERMAN = r"Indikative Aufschlüsselung der Programmmittel \(EU\) nach Art der Intervention"
+
+# Accepts "2.1.1.1.3" or "2.A.1.2.3" etc.
 SECTION_ID = r"(?:\d+(?:\.\d+)*|(?:\d+\.)?[A-Z](?:\.\d+)*)"
 
-# Block start: captures section id like 2.1.1.1.3 or 2.A.4.1.3
+# Block start line: "<section> Indikative Aufschlüsselung ..."
 RE_BLOCK_START = re.compile(
     rf"^\s*(?P<section>{SECTION_ID})\s+{SECTION_TITLE_GERMAN}\s*$",
     flags=re.MULTILINE
 )
 
-# Block end: a conservative "next header" detector
+# A conservative "new section header" to help delimit blocks if needed
 RE_NEXT_SECTION = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", flags=re.MULTILINE)
 
-# Context line (flexible):
-# - Allows blank lines before it (we search anywhere in block_text)
-# - Accepts either 3 or 4 segments:
-#     "Priorität X / Spezifisches Ziel Y / Fonds Z"
-#     "Priorität X / Spezifisches Ziel Y / Fonds Z / Scope"
-#     "Priorität X / Spezifisches Ziel Y / EFRE / Übergangsregion"
-# - "Fonds " prefix is optional; Ziel can be alphanumeric ("JTF")
-RE_CONTEXT = re.compile(
-    r"Priorität\s+(?P<prio>\d+)\s*/\s*"
-    r"Spezifisches\s+Ziel\s+(?P<ziel>[^/|\n]+?)\s*/\s*"
-    r"(?:(?:Fonds)\s+)?(?P<funding>[^/|\n]+?)"
-    r"(?:\s*/\s*(?P<scope>[^\n]+))?",
-    flags=re.IGNORECASE
-)
+# Context line(s). We’ll match the "Priorität" and "Spezifisches Ziel" first,
+# then flexibly parse the tail parts separated by "/".
+RE_PRIORITAET = re.compile(r"Priorität\s+(?P<prio>[0-9]+)\s*", flags=re.IGNORECASE)
+RE_SPEZIFISCHES_ZIEL = re.compile(r"Spezifisches\s+Ziel\s+(?P<ziel>[0-9A-Z\.]+)\s*", flags=re.IGNORECASE)
 
-# "Tabelle 1: Dimension 1 – Interventionsbereich"
-RE_DIMENSION = re.compile(
-    r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+?)\s*$",
-    flags=re.MULTILINE
-)
+# Dimension header
+RE_DIMENSION = re.compile(r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+?)\s*$", flags=re.MULTILINE)
 
-# Table header line: "Code Beschreibung Betrag (EUR)"
-RE_TABLE_HEADER = re.compile(
-    r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$",
-    flags=re.MULTILINE
-)
+# Table header (robust spacing)
+RE_TABLE_HEADER = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
-# Code line (first line of a row)
+# Row parsing
 RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>.+)$")
-
-# Amount-only line "15.000.000" or "25.000.000,00"
 RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$")
-
-# Amount at end of line (handle one-line rows if present)
 RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$")
 
-# --- Helpers ---------------------------------------------------------------
+# --- Helpers -----------------------------------------------------------------
 
 def _norm_amount(s: str) -> float:
     s = s.strip().replace(".", "").replace(" ", "").replace("\u00A0", "")
@@ -83,6 +69,7 @@ def _norm_amount(s: str) -> float:
         return float("nan")
 
 def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
+    """Locate target sections and slice their text."""
     blocks: List[Dict[str, str]] = []
     starts = list(RE_BLOCK_START.finditer(full_text))
     if not starts:
@@ -91,39 +78,80 @@ def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
     for idx, m in enumerate(starts):
         start_idx = m.end()
         section_id = m.group("section").strip()
-
-        # End at next block start if present, else at next generic header, else EOF
         if idx + 1 < len(starts):
             end_idx = starts[idx + 1].start()
         else:
             nxt = RE_NEXT_SECTION.search(full_text, pos=start_idx)
             end_idx = nxt.start() if nxt else len(full_text)
-
         block_text = full_text[start_idx:end_idx].strip("\n")
         blocks.append({"section": section_id, "text": block_text})
     return blocks
 
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
+    """
+    Accepts:
+      - 'Priorität X / Spezifisches Ziel Y / EFRE / Übergangsregion'
+      - 'Priorität 6 / Spezifisches Ziel JTF / Fonds JTF'
+    Returns empty Scope when not provided.
+    """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": None}
-    m = RE_CONTEXT.search(block_text)
-    if m:
-        # Clean trailing/leading whitespace
-        ctx["Priorität"] = (m.group("prio") or "").strip()
-        ctx["Spezifisches Ziel"] = (m.group("ziel") or "").strip()
-        ctx["Funding Programme"] = (m.group("funding") or "").strip()
-        scope = m.group("scope")
-        ctx["Scope"] = scope.strip() if scope else None
+
+    # Search the first line containing "Priorität"
+    lines = [ln.strip() for ln in block_text.splitlines() if ln.strip() != ""]
+    prior_line = None
+    for ln in lines:
+        if "Priorität" in ln:
+            prior_line = ln
+            break
+    if not prior_line:
+        return ctx
+
+    # Extract Priorität
+    m_prio = RE_PRIORITAET.search(prior_line)
+    if m_prio:
+        ctx["Priorität"] = m_prio.group("prio")
+
+    # Extract Spezifisches Ziel
+    m_ziel = RE_SPEZIFISCHES_ZIEL.search(prior_line)
+    if m_ziel:
+        ctx["Spezifisches Ziel"] = m_ziel.group("ziel")
+
+    # Tail after "... Ziel <val>" -> split by '/'
+    tail_start = None
+    if m_ziel:
+        tail_start = m_ziel.end()
+    elif m_prio:
+        tail_start = m_prio.end()
+    if tail_start is None:
+        return ctx
+
+    tail = prior_line[tail_start:].strip()
+    # Remove leading/trailing slashes and whitespace
+    tail = tail.strip(" /")
+    parts = [p.strip() for p in tail.split("/") if p.strip()]
+
+    # Interpret parts:
+    #  - 2 parts -> Funding, Scope
+    #  - 1 part -> Funding only
+    #  - 0 parts -> neither
+    if len(parts) >= 2:
+        ctx["Funding Programme"] = parts[0]
+        ctx["Scope"] = parts[1]
+    elif len(parts) == 1:
+        ctx["Funding Programme"] = parts[0]
+        ctx["Scope"] = None
+
     return ctx
 
 def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[str, float]]]:
     rows: List[Dict[str, Union[str, float]]] = []
     ctx = _extract_context(block_text)
 
+    # Each dimension table
     for dim_match in RE_DIMENSION.finditer(block_text):
         dim_start = dim_match.end()
         dimension_label = dim_match.group("dimension").strip()
 
-        # End of this dimension section
         next_dim = RE_DIMENSION.search(block_text, pos=dim_start)
         local_end = next_dim.start() if next_dim else len(block_text)
         local_text = block_text[dim_start:local_end]
@@ -137,7 +165,7 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
 
         lines = [ln.rstrip() for ln in snippet.splitlines() if ln.strip() != ""]
         i = 0
-        current_code: Optional[str] = None
+        current_code = None
         current_desc_parts: List[str] = []
 
         def emit_row(amount_str: str):
@@ -182,14 +210,14 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
                 i += 1
                 continue
 
-            # Amount-only line that closes the current row
+            # Amount-only line closes the row
             mamt = RE_AMOUNT_ONLY.match(ln)
             if mamt and current_code is not None:
                 emit_row(mamt.group("amt"))
                 i += 1
                 continue
 
-            # Otherwise it's a wrapped description line -> append
+            # Otherwise: wrapped description line
             if current_code is not None:
                 current_desc_parts.append(ln.strip())
             i += 1
@@ -197,6 +225,7 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
     return rows
 
 def parse_pdf_text(full_text: str) -> pd.DataFrame:
+    """Parse complete PDF text into a DataFrame of rows."""
     blocks = _extract_blocks(full_text)
     all_rows: List[Dict[str, Union[str, float]]] = []
     for b in blocks:
@@ -223,6 +252,7 @@ def parse_pdf_text(full_text: str) -> pd.DataFrame:
     return df
 
 def parse_pdf_filelike(file_like) -> pd.DataFrame:
+    """Parse a single PDF (UploadedFile or file-like) into a DataFrame."""
     if hasattr(file_like, "seek"):
         try:
             file_like.seek(0)
@@ -230,3 +260,4 @@ def parse_pdf_filelike(file_like) -> pd.DataFrame:
             pass
     text = _pdf_to_text(file_like)
     return parse_pdf_text(text)
+
