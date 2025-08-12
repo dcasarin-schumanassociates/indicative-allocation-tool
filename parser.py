@@ -139,6 +139,16 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
     for dim_match in RE_DIMENSION.finditer(block_text):
         dim_start = dim_match.end()
         dimension_label = dim_match.group("dimension").strip()
+        # Grab continuation lines until stop condition
+        continuation_lines = []
+        for extra_line in block_text[dim_start:].splitlines()[0:]:
+            if not extra_line.strip():
+                break
+            if extra_line.strip().startswith("Code") or extra_line.strip().startswith("Tabelle"):
+                break
+            continuation_lines.append(extra_line.strip())
+        if continuation_lines:
+            dimension_label += " " + " ".join(continuation_lines)
 
         next_dim = RE_DIMENSION.search(block_text, pos=dim_start)
         local_end = next_dim.start() if next_dim else len(block_text)
