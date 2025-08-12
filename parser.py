@@ -40,12 +40,15 @@ RE_NEXT_SECTION = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", fl
 RE_DIMENSION = re.compile(r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+?)\s*$", flags=re.MULTILINE)
 RE_TABLE_HEADER = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
-# Allow 2- or 3-digit codes; require at least one space after code
-RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>.+)$")
+# ✅ Allow 2–3 digit codes; require description to start with a letter or "("
+RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>[A-Za-zÄÖÜäöüß(].+)$")
 
-# Amount patterns (amount-only line or trailing at end of code/desc line)
+# Amounts (amount-only line, or trailing at end of line)
 RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
+
+# Section header inside a block (to stop table scan if another section starts)
+RE_SECTION_HEADER_INLINE = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", flags=re.MULTILINE)
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -151,8 +154,11 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         dim_start = dim_match.end()
         dimension_label = dim_match.group("dimension").strip()
 
+        # end of this dimension = next "Tabelle ..." or next section header
         next_dim = RE_DIMENSION.search(block_text, pos=dim_start)
-        local_end = next_dim.start() if next_dim else len(block_text)
+        next_hdr = RE_SECTION_HEADER_INLINE.search(block_text, pos=dim_start)
+        cut_points = [p.start() for p in [next_dim, next_hdr] if p]
+        local_end = min(cut_points) if cut_points else len(block_text)
         local_text = block_text[dim_start:local_end]
 
         # ✅ Checker step: only parse if header "Code Beschreibung Betrag (EUR)" exists
@@ -193,10 +199,25 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         while i < len(lines):
             ln = lines[i]
 
-            # New code row => boundary for previous row
+            # New code row? (guarded to start with a letter/"(" after the number)
             mcode = RE_CODE_LINE.match(ln)
             if mcode:
+                # 🔎 Look-ahead: ensure an amount occurs soon (within next ~8 lines)
+                lookahead_has_amount = False
+                for j in range(i, min(i + 9, len(lines))):
+                    if RE_AMOUNT_TRAILING.search(lines[j]) or RE_AMOUNT_ONLY.match(lines[j]):
+                        lookahead_has_amount = True
+                        break
+                    if _looks_like_new_table_marker(lines[j]) or RE_CODE_LINE.match(lines[j]):
+                        break
+                if not lookahead_has_amount:
+                    # Probably narrative numbers like "90 %" -> skip
+                    i += 1
+                    continue
+
+                # boundary for previous row
                 emit_if_complete()
+
                 current_code = mcode.group("code")
                 rest = mcode.group("rest").strip()
 
