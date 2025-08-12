@@ -40,10 +40,11 @@ RE_NEXT_SECTION = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", fl
 RE_DIMENSION = re.compile(r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+?)\s*$", flags=re.MULTILINE)
 RE_TABLE_HEADER = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
+# Allow two or three digits
 RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>.+)$")
-# Accept amount-only lines like "15.000.000" or "25.000.000,00" optionally followed by "EUR"
+
+# Amount patterns
 RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
-# Accept amount at end of a line (same-line amount after Beschreibung)
 RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 
 # --- Helpers -----------------------------------------------------------------
@@ -57,12 +58,10 @@ def _norm_amount(s: str) -> float:
         return float("nan")
 
 def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
-    """Locate target sections and slice their text."""
     blocks: List[Dict[str, str]] = []
     starts = list(RE_BLOCK_START.finditer(full_text))
     if not starts:
         return []
-
     for idx, m in enumerate(starts):
         start_idx = m.end()
         section_id = m.group("section").strip()
@@ -76,23 +75,14 @@ def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
     return blocks
 
 def _split_parts_by_slash(s: str) -> List[str]:
-    # Normalise non-breaking spaces and split by ASCII slash only
     s = s.replace("\u00A0", " ")
-    parts = [p.strip() for p in s.split("/") if p.strip()]
-    return parts
+    return [p.strip() for p in s.split("/") if p.strip()]
 
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
-    """
-    Robustly capture context:
-      - Split by '/'
-      - Only stitch next line if needed
-      - Scope = "" when missing (3-part case)
-    """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": ""}
 
     lines = [ln.strip().replace("\u00A0", " ") for ln in block_text.splitlines() if ln.strip()]
 
-    # Find the first line containing "Priorität"
     idx = None
     for i, ln in enumerate(lines):
         if "Priorität" in ln:
@@ -104,19 +94,16 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     candidate = lines[idx]
     parts = _split_parts_by_slash(candidate)
 
-    # Stitch next line if we still have <3 parts and the next line looks like continuation
     if len(parts) < 3 and idx + 1 < len(lines):
         nxt = lines[idx + 1]
         if not re.match(r"^(Tabelle|Dimension|Code)\b", nxt):
             candidate = candidate + " / " + nxt
             parts = _split_parts_by_slash(candidate)
 
-    # Extract values
     if len(parts) >= 2:
         m = re.search(r"Priorität\s+(.+)", parts[0], flags=re.IGNORECASE)
         if m:
             ctx["Priorität"] = m.group(1).strip()
-
         m = re.search(r"Spezifisches\s+Ziel\s+(.+)", parts[1], flags=re.IGNORECASE)
         if m:
             ctx["Spezifisches Ziel"] = m.group(1).strip()
@@ -130,19 +117,12 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
 
     return ctx
 
-# --- Description stitching ----------------------------------------------------
+# --- Beschreibung stitching ---------------------------------------------------
 
 def _normalise_soft_hyphen(s: str) -> str:
-    # Remove soft hyphens (U+00AD) that often appear in PDF-extracted text
     return s.replace("\u00AD", "")
 
 def _join_desc_parts(parts: List[str]) -> str:
-    """
-    Join wrapped Beschreibung lines, fixing hyphenation.
-    - Remove soft hyphens.
-    - If previous fragment ends with '-', join without space.
-    - Otherwise join with a single space.
-    """
     if not parts:
         return ""
     cleaned = [_normalise_soft_hyphen(p.strip()) for p in parts if p.strip()]
@@ -154,9 +134,7 @@ def _join_desc_parts(parts: List[str]) -> str:
             out = out[:-1] + nxt
         else:
             out = f"{out} {nxt}"
-    # collapse multi-spaces
-    out = re.sub(r"\s{2,}", " ", out).strip()
-    return out
+    return re.sub(r"\s{2,}", " ", out).strip()
 
 def _looks_like_new_table_marker(s: str) -> bool:
     return bool(re.match(r"^\s*(Tabelle\s+\d+|Dimension\s+\d+|Code\s+Beschreibung\s+Betrag)", s))
@@ -167,7 +145,6 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
     rows: List[Dict[str, Union[str, float]]] = []
     ctx = _extract_context(block_text)
 
-    # Each dimension table
     for dim_match in RE_DIMENSION.finditer(block_text):
         dim_start = dim_match.end()
         dimension_label = dim_match.group("dimension").strip()
@@ -177,7 +154,10 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         local_text = block_text[dim_start:local_end]
 
         th = RE_TABLE_HEADER.search(local_text)
-        local_start = th.end() if th else 0
+        if not th:
+            # 🚫 No table header -> skip to avoid false positives
+            continue
+        local_start = th.end()
 
         snippet = local_text[local_start:].strip("\n")
         if not snippet:
@@ -188,12 +168,12 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
 
         current_code = None
         current_desc_parts: List[str] = []
-        pending_amount: Optional[str] = None  # NEW: store amount but don't emit yet
+        pending_amount: Optional[str] = None
 
         def emit_if_complete():
             nonlocal current_code, current_desc_parts, pending_amount
             if current_code is not None and pending_amount is not None:
-                row = {
+                rows.append({
                     "Indikative Aufschlüsselung (Section)": section_id,
                     "Priorität": ctx.get("Priorität"),
                     "Spezifisches Ziel": ctx.get("Spezifisches Ziel"),
@@ -203,9 +183,7 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
                     "Code": current_code,
                     "Beschreibung": _join_desc_parts(current_desc_parts),
                     "Betrag (EUR)": _norm_amount(pending_amount),
-                }
-                rows.append(row)
-            # reset row state
+                })
             current_code = None
             current_desc_parts = []
             pending_amount = None
@@ -213,14 +191,12 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         while i < len(lines):
             ln = lines[i]
 
-            # New code row => boundary for previous row
             mcode = RE_CODE_LINE.match(ln)
             if mcode:
-                emit_if_complete()  # flush previous row (if complete)
+                emit_if_complete()
                 current_code = mcode.group("code")
                 rest = mcode.group("rest").strip()
 
-                # If amount is on the same line, store it but DO NOT emit yet
                 trailing = RE_AMOUNT_TRAILING.search(rest)
                 if trailing:
                     pending_amount = trailing.group("amt")
@@ -232,25 +208,21 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
                 i += 1
                 continue
 
-            # Amount-only line => remember it, but STILL don't emit yet
             mamt = RE_AMOUNT_ONLY.match(ln)
             if mamt and current_code is not None:
                 pending_amount = mamt.group("amt")
                 i += 1
                 continue
 
-            # New header/table marker => boundary
             if _looks_like_new_table_marker(ln):
                 emit_if_complete()
                 i += 1
                 continue
 
-            # Otherwise it's a wrapped Beschreibung line
             if current_code is not None:
                 current_desc_parts.append(ln.strip())
             i += 1
 
-        # End of table: flush last row if complete
         emit_if_complete()
 
     return rows
