@@ -73,19 +73,27 @@ def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
         blocks.append({"section": section_id, "text": block_text})
     return blocks
 
+def _split_parts_by_slash(s: str) -> List[str]:
+    # Normalise non-breaking spaces and split by ASCII slash only
+    s = s.replace("\u00A0", " ")
+    parts = [p.strip() for p in s.split("/") if p.strip()]
+    return parts
+
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     """
-    Original working logic:
-      - Handle extra blank lines
-      - Grab whole tail after Spezifisches Ziel and split by '/'
-      - Works with 3-part and 4-part contexts
+    Robustly capture context:
+      - No single-char regex groups for Funding/Scope (prevents truncation).
+      - Split by '/'.
+      - Only stitch in next line if the first line has < 3 parts AND next line
+        is not clearly the start of the next section/table.
+      - Returns Scope="" when missing (3-part case).
     """
-    ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": None}
+    ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": ""}
 
-    # Remove blank lines
-    lines = [ln.strip() for ln in block_text.splitlines() if ln.strip()]
+    # Non-empty lines, with NBSP normalised
+    lines = [ln.strip().replace("\u00A0", " ") for ln in block_text.splitlines() if ln.strip()]
 
-    # Find first "Priorität" line
+    # Find the first line containing "Priorität"
     idx = None
     for i, ln in enumerate(lines):
         if "Priorität" in ln:
@@ -94,32 +102,32 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     if idx is None:
         return ctx
 
-    # Merge current line with the next (handles rare breaks)
-    merged = lines[idx]
-    if idx + 1 < len(lines):
-        merged += " / " + lines[idx + 1]
+    candidate = lines[idx]
+    parts = _split_parts_by_slash(candidate)
 
-    # Split by '/'
-    parts = [p.strip() for p in merged.split("/") if p.strip()]
+    # Only stitch the next line if we still have <3 parts and the next line looks like a continuation
+    if len(parts) < 3 and idx + 1 < len(lines):
+        nxt = lines[idx + 1]
+        if not re.match(r"^(Tabelle|Dimension|Code)\b", nxt):
+            candidate = candidate + " / " + nxt
+            parts = _split_parts_by_slash(candidate)
 
+    # Extract values
     if len(parts) >= 2:
-        # Priorität
-        prio_match = re.search(r"Priorität\s+(.+)", parts[0], flags=re.IGNORECASE)
-        if prio_match:
-            ctx["Priorität"] = prio_match.group(1).strip()
+        m = re.search(r"Priorität\s+(.+)", parts[0], flags=re.IGNORECASE)
+        if m:
+            ctx["Priorität"] = m.group(1).strip()
 
-        # Spezifisches Ziel
-        ziel_match = re.search(r"Spezifisches\s+Ziel\s+(.+)", parts[1], flags=re.IGNORECASE)
-        if ziel_match:
-            ctx["Spezifisches Ziel"] = ziel_match.group(1).strip()
+        m = re.search(r"Spezifisches\s+Ziel\s+(.+)", parts[1], flags=re.IGNORECASE)
+        if m:
+            ctx["Spezifisches Ziel"] = m.group(1).strip()
 
-    # Funding / Scope
     if len(parts) >= 4:
         ctx["Funding Programme"] = parts[2]
         ctx["Scope"] = parts[3]
     elif len(parts) == 3:
         ctx["Funding Programme"] = parts[2]
-        ctx["Scope"] = None
+        ctx["Scope"] = ""
 
     return ctx
 
@@ -233,4 +241,3 @@ def parse_pdf_filelike(file_like) -> pd.DataFrame:
             pass
     text = _pdf_to_text(file_like)
     return parse_pdf_text(text)
-
