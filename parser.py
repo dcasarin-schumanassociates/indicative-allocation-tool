@@ -14,12 +14,15 @@ def _pdf_to_text(file_like: Union[io.BytesIO, "UploadedFile"]) -> str:
                 text_parts.append(t)
     except Exception:
         try:
+            from pdfminer_high_level import extract_text  # type: ignore
+        except Exception:
             from pdfminer.high_level import extract_text  # type: ignore
-            if hasattr(file_like, "seek"):
-                try:
-                    file_like.seek(0)
-                except Exception:
-                    pass
+        if hasattr(file_like, "seek"):
+            try:
+                file_like.seek(0)
+            except Exception:
+                pass
+        try:
             text = extract_text(file_like)
             return text or ""
         except Exception:
@@ -42,8 +45,7 @@ RE_BLOCK_START = re.compile(
 # A conservative "new section header" to help delimit blocks if needed
 RE_NEXT_SECTION = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", flags=re.MULTILINE)
 
-# Context line(s). We’ll match the "Priorität" and "Spezifisches Ziel" first,
-# then flexibly parse the tail parts separated by "/".
+# Context line(s)
 RE_PRIORITAET = re.compile(r"Priorität\s+(?P<prio>[0-9]+)\s*", flags=re.IGNORECASE)
 RE_SPEZIFISCHES_ZIEL = re.compile(r"Spezifisches\s+Ziel\s+(?P<ziel>[0-9A-Z\.]+)\s*", flags=re.IGNORECASE)
 
@@ -61,12 +63,26 @@ RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$")
 # --- Helpers -----------------------------------------------------------------
 
 def _norm_amount(s: str) -> float:
-    s = s.strip().replace(".", "").replace(" ", "").replace("\u00A0", "")
+    s = s.strip().replace("\u00A0", " ").replace(".", "").replace(" ", "")
     s = s.replace(",", ".")
     try:
         return float(s)
     except ValueError:
         return float("nan")
+
+def _squash_spaces(s: str) -> str:
+    # Normalise whitespace and non-breaking spaces
+    return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
+
+def _collapse_spaced_caps(s: str) -> str:
+    """
+    Turn 'E F R E' => 'EFRE', 'J T F' => 'JTF'.
+    Only collapses when the token is 2–6 single-letter A–Z chunks separated by spaces.
+    """
+    t = _squash_spaces(s)
+    if re.fullmatch(r"(?:[A-ZÄÖÜ]{1}\s+){1,5}[A-ZÄÖÜ]{1}", t):
+        return t.replace(" ", "")
+    return t
 
 def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
     """Locate target sections and slice their text."""
@@ -92,19 +108,19 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     Accepts:
       - 'Priorität X / Spezifisches Ziel Y / EFRE / Übergangsregion'
       - 'Priorität 6 / Spezifisches Ziel JTF / Fonds JTF'
+      - Handles non-breaking spaces and spaced letters (e.g. 'E F R E', 'J T F').
     Returns empty Scope when not provided.
     """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": None}
 
-    # Search the first line containing "Priorität"
-    lines = [ln.strip() for ln in block_text.splitlines() if ln.strip() != ""]
-    prior_line = None
-    for ln in lines:
-        if "Priorität" in ln:
-            prior_line = ln
-            break
+    # Search the first meaningful line containing "Priorität" (skip blank lines)
+    lines = [ln for ln in (ln.strip() for ln in block_text.splitlines()) if ln]
+    prior_line = next((ln for ln in lines if "Priorität" in ln), None)
     if not prior_line:
         return ctx
+
+    # Normalise spaces in that line early
+    prior_line = _squash_spaces(prior_line)
 
     # Extract Priorität
     m_prio = RE_PRIORITAET.search(prior_line)
@@ -114,32 +130,26 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     # Extract Spezifisches Ziel
     m_ziel = RE_SPEZIFISCHES_ZIEL.search(prior_line)
     if m_ziel:
-        ctx["Spezifisches Ziel"] = m_ziel.group("ziel")
+        ctx["Spezifisches Ziel"] = _collapse_spaced_caps(m_ziel.group("ziel"))
 
-    # Tail after "... Ziel <val>" -> split by '/'
-    tail_start = None
-    if m_ziel:
-        tail_start = m_ziel.end()
-    elif m_prio:
-        tail_start = m_prio.end()
+    # Tail after Ziel (preferred) or after Priorität (fallback)
+    tail_start = m_ziel.end() if m_ziel else (m_prio.end() if m_prio else None)
     if tail_start is None:
         return ctx
 
-    tail = prior_line[tail_start:].strip()
-    # Remove leading/trailing slashes and whitespace
+    tail = _squash_spaces(prior_line[tail_start:])
     tail = tail.strip(" /")
-    parts = [p.strip() for p in tail.split("/") if p.strip()]
+    if not tail:
+        return ctx
 
-    # Interpret parts:
-    #  - 2 parts -> Funding, Scope
-    #  - 1 part -> Funding only
-    #  - 0 parts -> neither
+    # Split on slash into up to two parts (funding, scope)
+    parts = [p.strip() for p in tail.split("/") if p.strip()]
+    if len(parts) >= 1:
+        funding = _collapse_spaced_caps(parts[0])
+        ctx["Funding Programme"] = funding
     if len(parts) >= 2:
-        ctx["Funding Programme"] = parts[0]
-        ctx["Scope"] = parts[1]
-    elif len(parts) == 1:
-        ctx["Funding Programme"] = parts[0]
-        ctx["Scope"] = None
+        scope = _collapse_spaced_caps(parts[1])
+        ctx["Scope"] = scope
 
     return ctx
 
@@ -150,7 +160,7 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
     # Each dimension table
     for dim_match in RE_DIMENSION.finditer(block_text):
         dim_start = dim_match.end()
-        dimension_label = dim_match.group("dimension").strip()
+        dimension_label = _squash_spaces(dim_match.group("dimension"))
 
         next_dim = RE_DIMENSION.search(block_text, pos=dim_start)
         local_end = next_dim.start() if next_dim else len(block_text)
@@ -196,7 +206,7 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
             mcode = RE_CODE_LINE.match(ln)
             if mcode:
                 current_code = mcode.group("code")
-                rest = mcode.group("rest").strip()
+                rest = _squash_spaces(mcode.group("rest"))
 
                 # If amount is on the same line, split it off
                 trailing = RE_AMOUNT_TRAILING.search(rest)
@@ -219,7 +229,7 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
 
             # Otherwise: wrapped description line
             if current_code is not None:
-                current_desc_parts.append(ln.strip())
+                current_desc_parts.append(_squash_spaces(ln))
             i += 1
 
     return rows
@@ -260,4 +270,3 @@ def parse_pdf_filelike(file_like) -> pd.DataFrame:
             pass
     text = _pdf_to_text(file_like)
     return parse_pdf_text(text)
-
