@@ -13,24 +13,12 @@ st.sidebar.header("Instructions")
 st.sidebar.markdown(
     """
 1. **Upload** one or more programme PDFs.
-2. Click **Parse PDFs** to extract rows (fresh parse each time).
+2. Click **Parse PDFs** to extract rows.
 3. Use the **Keep** checkboxes to choose rows to export.
-4. Click **Download Excel** to export your selection.
+4. Optionally **sort** the preview (and export) using the controls below.
+5. Click **Download Excel** to export your selection.
     """
 )
-
-# EASY CACHE-BUSTER: increment this when you change parser logic
-PARSER_VERSION = "v3.2"
-
-# A manual re-parse button that ensures a clean state
-col_a, col_b = st.columns([1,1])
-with col_a:
-    parse_clicked = st.button("Parse PDFs", type="primary")
-with col_b:
-    reparse_clicked = st.button("Re-parse (force fresh)")
-
-# Optional: a tiny debug toggle to verify Funding/Scope and wrapped Beschreibung
-show_debug = st.checkbox("Show debug context columns", value=False, help="Displays the parsed context to verify Funding/Scope and long descriptions.")
 
 uploaded_files = st.file_uploader(
     "Upload PDF files",
@@ -39,16 +27,12 @@ uploaded_files = st.file_uploader(
     help="You can upload multiple PDFs at once."
 )
 
-def parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> pd.DataFrame:
+parse_clicked = st.button("Parse PDFs", type="primary", disabled=(len(uploaded_files) == 0))
+
+def _parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> pd.DataFrame:
     all_rows = []
     for f in files:
         try:
-            # IMPORTANT: read from the beginning every time
-            if hasattr(f, "seek"):
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
             df = parse_pdf_filelike(f)
             if df is not None and not df.empty:
                 all_rows.append(df)
@@ -57,54 +41,72 @@ def parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> pd
     if not all_rows:
         return pd.DataFrame()
     out = pd.concat(all_rows, ignore_index=True)
+    # Default selection = keep all
     out.insert(0, "Keep", True)
     return out
 
-if (parse_clicked or reparse_clicked) and uploaded_files:
-    # Hard cache-bust: include parser version + file names + sizes in a throwaway state key
-    st.session_state["cache_bust_key"] = (
-        PARSER_VERSION,
-        tuple((f.name, f.size) for f in uploaded_files),
-        parse_clicked,  # toggling these will also change the key
-        reparse_clicked
-    )
-
+if parse_clicked:
     with st.spinner("Parsing PDFs..."):
-        df = parse_many(uploaded_files)
+        df = _parse_many(uploaded_files)
 
     if df is None or df.empty:
         st.info("No rows extracted. Please verify the PDFs contain the expected sections.")
     else:
-        # Optional debug visibility (helps verify Funding/Scope/long Beschreibung)
-        if show_debug:
-            dbg_cols = [c for c in [
-                "Indikative Aufschlüsselung (Section)",
-                "Priorität",
-                "Spezifisches Ziel",
-                "Funding Programme",
-                "Scope",
-                "Dimension",
-                "Code",
-                "Beschreibung",
-                "Betrag (EUR)",
-            ] if c in df.columns]
-            st.expander("Parsed rows (debug view)").dataframe(df[["Keep"] + dbg_cols], use_container_width=True)
+        st.subheader("Sorting")
+        st.write("You can also click column headers in the table to sort interactively. "
+                 "Use the controls below for reproducible, multi-column sorting (and to apply sorting to the export).")
+
+        # Build choices excluding the checkbox column
+        sortable_cols = [c for c in df.columns if c != "Keep"]
+
+        # Multi-column selection
+        sort_cols = st.multiselect(
+            "Sort by column(s)",
+            options=sortable_cols,
+            default=["Indikative Aufschlüsselung (Section)", "Dimension", "Code"]
+            if {"Indikative Aufschlüsselung (Section)", "Dimension", "Code"}.issubset(df.columns)
+            else []
+        )
+
+        # Direction per selected column
+        sort_dirs = []
+        if sort_cols:
+            st_cols = st.columns(len(sort_cols))
+            for i, col in enumerate(sort_cols):
+                with st_cols[i]:
+                    asc = st.toggle(f"↑ Asc for “{col}”", value=True, key=f"asc_{col}")
+                    sort_dirs.append(asc)
+
+        apply_sort_to_export = st.checkbox("Apply sorting to exported Excel", value=True)
+
+        # Apply deterministic sorting for preview (stable)
+        preview_df = df.copy()
+        if sort_cols:
+            preview_df = preview_df.sort_values(by=sort_cols, ascending=sort_dirs, kind="stable", ignore_index=True)
 
         st.subheader("Preview & Select")
-        st.write("Use the **Keep** column to select rows for export. You can sort and filter as needed.")
+        st.write("Use the **Keep** column to select rows for export. You can still click column headers to sort ad-hoc.")
+
         edited = st.data_editor(
-            df,
+            preview_df,
             use_container_width=True,
             num_rows="dynamic",
             hide_index=True,
-            key=f"preview_editor_{st.session_state.get('cache_bust_key')}",
+            key="preview_editor",
             column_config={
                 "Keep": st.column_config.CheckboxColumn("Keep"),
                 "Betrag (EUR)": st.column_config.NumberColumn("Betrag (EUR)", step=1, format="%.2f"),
             }
         )
 
+        # Build export DataFrame
         to_export = edited[edited["Keep"] == True].drop(columns=["Keep"]) if "Keep" in edited.columns else edited
+        if apply_sort_to_export and sort_cols:
+            # Ensure export respects the selected order
+            # (Use the edited columns to preserve any in-grid edits)
+            valid_sort_cols = [c for c in sort_cols if c in to_export.columns]
+            if valid_sort_cols:
+                to_export = to_export.sort_values(by=valid_sort_cols, ascending=sort_dirs, kind="stable", ignore_index=True)
 
         st.divider()
         st.subheader("Export")
