@@ -29,42 +29,17 @@ def _pdf_to_text(file_like: Union[io.BytesIO, "UploadedFile"]) -> str:
 # --- Regex patterns -----------------------------------------------------------
 
 SECTION_TITLE_GERMAN = r"Indikative Aufschlüsselung der Programmmittel \(EU\) nach Art der Intervention"
-
-# Accepts "2.1.1.1.3" or "2.A.1.2.3" etc.
 SECTION_ID = r"(?:\d+(?:\.\d+)*|(?:\d+\.)?[A-Z](?:\.\d+)*)"
 
-# Block start line: "<section> Indikative Aufschlüsselung ..."
 RE_BLOCK_START = re.compile(
     rf"^\s*(?P<section>{SECTION_ID})\s+{SECTION_TITLE_GERMAN}\s*$",
     flags=re.MULTILINE
 )
-
-# Delimiter to find a possible next section if needed
 RE_NEXT_SECTION = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", flags=re.MULTILINE)
 
-# Context (explicit patterns; allow spaces & diacritics in funding/scope)
-# 4-part: Priorität / Spezifisches Ziel / Funding / Scope
-RE_CONTEXT_4 = re.compile(
-    r"Priorität\s+(?P<prio>\d+)\s*/\s*Spezifisches\s+Ziel\s+(?P<ziel>[\dA-Z\.]+)\s*/\s*"
-    r"(?P<funding>[A-Za-zÄÖÜäöüß\+\-][A-Za-zÄÖÜäöüß\+\-\s\.]*)\s*/\s*"
-    r"(?P<scope>[A-Za-zÄÖÜäöüß0-9\-\s\.,/()]+)",
-    flags=re.IGNORECASE
-)
-
-# 3-part: Priorität / Spezifisches Ziel / Funding    (Scope = empty)
-RE_CONTEXT_3 = re.compile(
-    r"Priorität\s+(?P<prio>\d+)\s*/\s*Spezifisches\s+Ziel\s+(?P<ziel>[\dA-Z\.]+)\s*/\s*"
-    r"(?P<funding>[A-Za-zÄÖÜäöüß\+\-][A-Za-zÄÖÜäöüß\+\-\s\.]*)",
-    flags=re.IGNORECASE
-)
-
-# Dimension header
 RE_DIMENSION = re.compile(r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+?)\s*$", flags=re.MULTILINE)
-
-# Table header (robust spacing)
 RE_TABLE_HEADER = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
-# Row parsing
 RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>.+)$")
 RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$")
 RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$")
@@ -100,17 +75,17 @@ def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
 
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     """
-    Accepts:
-      - 'Priorität X / Spezifisches Ziel Y / EFRE / Übergangsregion'
-      - 'Priorität 6 / Spezifisches Ziel JTF / Fonds JTF'
-    Looks across up to 2 lines to handle an extra line break after the header.
+    Robustly capture context, handling:
+      - Extra blank lines
+      - Line breaks within Funding/Scope
+      - 3-part (no scope) or 4-part contexts
     """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": None}
 
-    # Non-empty lines for robustness (skip blank line that may precede the context)
+    # Non-empty lines for robustness
     lines = [ln.strip() for ln in block_text.splitlines() if ln.strip() != ""]
 
-    # Find the first line containing "Priorität"
+    # Find first line containing "Priorität"
     idx = None
     for i, ln in enumerate(lines):
         if "Priorität" in ln:
@@ -119,30 +94,36 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     if idx is None:
         return ctx
 
-    # Stitch up to two lines: current + next (some PDFs break after the second slash)
-    candidate = lines[idx]
-    if idx + 1 < len(lines):
-        candidate = candidate + " / " + lines[idx + 1]
+    # Merge consecutive lines until we have at least 3 parts split by "/"
+    candidate_parts = []
+    merged = lines[idx]
+    j = idx + 1
+    while merged.count("/") < 3 and j < len(lines):
+        merged += " / " + lines[j]
+        j += 1
 
-    # Try 4-part first
-    m4 = RE_CONTEXT_4.search(candidate)
-    if m4:
-        ctx["Priorität"] = m4.group("prio")
-        ctx["Spezifisches Ziel"] = m4.group("ziel")
-        ctx["Funding Programme"] = m4.group("funding").strip()
-        ctx["Scope"] = m4.group("scope").strip()
-        return ctx
+    # Now split by "/"
+    candidate_parts = [p.strip() for p in merged.split("/") if p.strip()]
 
-    # Fallback to 3-part (Scope empty)
-    m3 = RE_CONTEXT_3.search(candidate)
-    if m3:
-        ctx["Priorität"] = m3.group("prio")
-        ctx["Spezifisches Ziel"] = m3.group("ziel")
-        ctx["Funding Programme"] = m3.group("funding").strip()
-        ctx["Scope"] = None
-        return ctx
+    if len(candidate_parts) >= 2:
+        # Extract Priorität (first part)
+        prio_match = re.search(r"Priorität\s+(\S+)", candidate_parts[0], flags=re.IGNORECASE)
+        if prio_match:
+            ctx["Priorität"] = prio_match.group(1)
 
-    # If nothing matches, leave as None
+        # Extract Spezifisches Ziel (second part)
+        ziel_match = re.search(r"Spezifisches\s+Ziel\s+(.+)", candidate_parts[1], flags=re.IGNORECASE)
+        if ziel_match:
+            ctx["Spezifisches Ziel"] = ziel_match.group(1)
+
+        # Funding & Scope
+        if len(candidate_parts) >= 4:
+            ctx["Funding Programme"] = candidate_parts[2]
+            ctx["Scope"] = candidate_parts[3]
+        elif len(candidate_parts) == 3:
+            ctx["Funding Programme"] = candidate_parts[2]
+            ctx["Scope"] = None
+
     return ctx
 
 def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[str, float]]]:
@@ -194,13 +175,11 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         while i < len(lines):
             ln = lines[i]
 
-            # Start of a new code row?
             mcode = RE_CODE_LINE.match(ln)
             if mcode:
                 current_code = mcode.group("code")
                 rest = mcode.group("rest").strip()
 
-                # If amount is on the same line, split it off
                 trailing = RE_AMOUNT_TRAILING.search(rest)
                 if trailing:
                     amt = trailing.group("amt")
@@ -212,14 +191,12 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
                 i += 1
                 continue
 
-            # Amount-only line closes the row
             mamt = RE_AMOUNT_ONLY.match(ln)
             if mamt and current_code is not None:
                 emit_row(mamt.group("amt"))
                 i += 1
                 continue
 
-            # Otherwise: wrapped description line
             if current_code is not None:
                 current_desc_parts.append(ln.strip())
             i += 1
@@ -227,7 +204,6 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
     return rows
 
 def parse_pdf_text(full_text: str) -> pd.DataFrame:
-    """Parse complete PDF text into a DataFrame of rows."""
     blocks = _extract_blocks(full_text)
     all_rows: List[Dict[str, Union[str, float]]] = []
     for b in blocks:
@@ -250,11 +226,9 @@ def parse_pdf_text(full_text: str) -> pd.DataFrame:
     for c in ordered_cols:
         if c not in df.columns:
             df[c] = None
-    df = df[ordered_cols]
-    return df
+    return df[ordered_cols]
 
 def parse_pdf_filelike(file_like) -> pd.DataFrame:
-    """Parse a single PDF (UploadedFile or file-like) into a DataFrame."""
     if hasattr(file_like, "seek"):
         try:
             file_like.seek(0)
