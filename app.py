@@ -13,11 +13,24 @@ st.sidebar.header("Instructions")
 st.sidebar.markdown(
     """
 1. **Upload** one or more programme PDFs.
-2. Click **Parse PDFs** to extract rows.
+2. Click **Parse PDFs** to extract rows (fresh parse each time).
 3. Use the **Keep** checkboxes to choose rows to export.
 4. Click **Download Excel** to export your selection.
     """
 )
+
+# EASY CACHE-BUSTER: increment this when you change parser logic
+PARSER_VERSION = "v3.2"
+
+# A manual re-parse button that ensures a clean state
+col_a, col_b = st.columns([1,1])
+with col_a:
+    parse_clicked = st.button("Parse PDFs", type="primary")
+with col_b:
+    reparse_clicked = st.button("Re-parse (force fresh)")
+
+# Optional: a tiny debug toggle to verify Funding/Scope and wrapped Beschreibung
+show_debug = st.checkbox("Show debug context columns", value=False, help="Displays the parsed context to verify Funding/Scope and long descriptions.")
 
 uploaded_files = st.file_uploader(
     "Upload PDF files",
@@ -26,12 +39,16 @@ uploaded_files = st.file_uploader(
     help="You can upload multiple PDFs at once."
 )
 
-parse_clicked = st.button("Parse PDFs", type="primary", disabled=(len(uploaded_files) == 0))
-
-def _parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> pd.DataFrame:
+def parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> pd.DataFrame:
     all_rows = []
     for f in files:
         try:
+            # IMPORTANT: read from the beginning every time
+            if hasattr(f, "seek"):
+                try:
+                    f.seek(0)
+                except Exception:
+                    pass
             df = parse_pdf_filelike(f)
             if df is not None and not df.empty:
                 all_rows.append(df)
@@ -40,26 +57,47 @@ def _parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> p
     if not all_rows:
         return pd.DataFrame()
     out = pd.concat(all_rows, ignore_index=True)
-    # Default selection = keep all
     out.insert(0, "Keep", True)
     return out
 
-if parse_clicked:
+if (parse_clicked or reparse_clicked) and uploaded_files:
+    # Hard cache-bust: include parser version + file names + sizes in a throwaway state key
+    st.session_state["cache_bust_key"] = (
+        PARSER_VERSION,
+        tuple((f.name, f.size) for f in uploaded_files),
+        parse_clicked,  # toggling these will also change the key
+        reparse_clicked
+    )
+
     with st.spinner("Parsing PDFs..."):
-        df = _parse_many(uploaded_files)
+        df = parse_many(uploaded_files)
 
     if df is None or df.empty:
         st.info("No rows extracted. Please verify the PDFs contain the expected sections.")
     else:
+        # Optional debug visibility (helps verify Funding/Scope/long Beschreibung)
+        if show_debug:
+            dbg_cols = [c for c in [
+                "Indikative Aufschlüsselung (Section)",
+                "Priorität",
+                "Spezifisches Ziel",
+                "Funding Programme",
+                "Scope",
+                "Dimension",
+                "Code",
+                "Beschreibung",
+                "Betrag (EUR)",
+            ] if c in df.columns]
+            st.expander("Parsed rows (debug view)").dataframe(df[["Keep"] + dbg_cols], use_container_width=True)
+
         st.subheader("Preview & Select")
         st.write("Use the **Keep** column to select rows for export. You can sort and filter as needed.")
-
         edited = st.data_editor(
             df,
             use_container_width=True,
             num_rows="dynamic",
             hide_index=True,
-            key="preview_editor",
+            key=f"preview_editor_{st.session_state.get('cache_bust_key')}",
             column_config={
                 "Keep": st.column_config.CheckboxColumn("Keep"),
                 "Betrag (EUR)": st.column_config.NumberColumn("Betrag (EUR)", step=1, format="%.2f"),
