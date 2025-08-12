@@ -38,16 +38,22 @@ RE_BLOCK_START = re.compile(
 RE_NEXT_SECTION = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", flags=re.MULTILINE)
 
 RE_DIMENSION = re.compile(r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+?)\s*$", flags=re.MULTILINE)
-RE_TABLE_HEADER = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
-# Allow 2- or 3-digit codes; require at least one space after code
-RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>.+)$")
+# Table headers: accept both 3-col and 2-col variants
+RE_TABLE_HEADER_3 = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
+RE_TABLE_HEADER_2 = re.compile(r"^\s*Code\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
-# Amount patterns (amount-only line or trailing at end of code/desc line)
+# Allow 2–3 digit codes; description must begin with a letter or "(" (filters "90 %")
+RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>[A-Za-zÄÖÜäöüß(].+)$")
+
+# Amounts: amount-only line or trailing at end of line
 RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 
-# --- Helpers -----------------------------------------------------------------
+# Inline section header (to cut dimension scan if a new section starts)
+RE_SECTION_HEADER_INLINE = re.compile(rf"^\s*(?:{SECTION_ID})\s+[A-ZÄÖÜa-zäöü]", flags=re.MULTILINE)
+
+# --- Small helpers ------------------------------------------------------------
 
 def _norm_amount(s: str) -> float:
     s = s.strip().replace(".", "").replace(" ", "").replace("\u00A0", "")
@@ -56,6 +62,14 @@ def _norm_amount(s: str) -> float:
         return float(s)
     except ValueError:
         return float("nan")
+
+def _is_page_number_line(s: str) -> bool:
+    # Pure page number like "56"
+    return bool(re.fullmatch(r"\d{1,4}", s.strip()))
+
+def _looks_like_running_header(s: str) -> bool:
+    # Add patterns if you see specific running headers/footers in other PDFs
+    return False
 
 def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
     blocks: List[Dict[str, str]] = []
@@ -79,6 +93,12 @@ def _split_parts_by_slash(s: str) -> List[str]:
     return [p.strip() for p in s.split("/") if p.strip()]
 
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
+    """
+    Robust context:
+      - Split by '/'
+      - Stitch next line only if needed
+      - Scope = "" when missing (3-part case)
+    """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": ""}
 
     lines = [ln.strip().replace("\u00A0", " ") for ln in block_text.splitlines() if ln.strip()]
@@ -139,7 +159,7 @@ def _join_desc_parts(parts: List[str]) -> str:
     return re.sub(r"\s{2,}", " ", out).strip()
 
 def _looks_like_new_table_marker(s: str) -> bool:
-    return bool(re.match(r"^\s*(Tabelle\s+\d+|Dimension\s+\d+|Code\s+Beschreibung\s+Betrag)", s))
+    return bool(re.match(r"^\s*(Tabelle\s+\d+|Dimension\s+\d+|Code\s+Beschreibung\s+Betrag|Code\s+Betrag\s+\(EUR\))", s))
 
 # --- Row extraction -----------------------------------------------------------
 
@@ -151,21 +171,27 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         dim_start = dim_match.end()
         dimension_label = dim_match.group("dimension").strip()
 
+        # end of this dimension = next "Tabelle ..." or next section header
         next_dim = RE_DIMENSION.search(block_text, pos=dim_start)
-        local_end = next_dim.start() if next_dim else len(block_text)
+        next_hdr = RE_SECTION_HEADER_INLINE.search(block_text, pos=dim_start)
+        cut_points = [p.start() for p in [next_dim, next_hdr] if p]
+        local_end = min(cut_points) if cut_points else len(block_text)
         local_text = block_text[dim_start:local_end]
 
-        # ✅ Checker step: only parse if header "Code Beschreibung Betrag (EUR)" exists
-        th = RE_TABLE_HEADER.search(local_text)
-        if not th:
+        # Checker step: require a table header (either 3-col or 2-col)
+        th3 = RE_TABLE_HEADER_3.search(local_text)
+        th2 = RE_TABLE_HEADER_2.search(local_text)
+        if not th3 and not th2:
             continue
-        local_start = th.end()
+        local_start = (th3.end() if th3 else th2.end())
 
         snippet = local_text[local_start:].strip("\n")
         if not snippet:
             continue
 
-        lines = [ln.rstrip() for ln in snippet.splitlines() if ln.strip() != ""]
+        # Lines within the table; keep non-empty but skip page numbers
+        raw_lines = [ln.rstrip() for ln in snippet.splitlines() if ln.strip() != ""]
+        lines = [ln for ln in raw_lines if not _is_page_number_line(ln) and not _looks_like_running_header(ln)]
         i = 0
 
         current_code = None
@@ -193,28 +219,40 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         while i < len(lines):
             ln = lines[i]
 
-            # New code row => boundary for previous row
+            # New code row?
             mcode = RE_CODE_LINE.match(ln)
             if mcode:
+                # flush previous (if complete)
                 emit_if_complete()
                 current_code = mcode.group("code")
                 rest = mcode.group("rest").strip()
 
+                # Amount on same line?
                 trailing = RE_AMOUNT_TRAILING.search(rest)
                 if trailing:
-                    pending_amount = trailing.group("amt")
-                    desc_part = rest[: trailing.start()].strip()
-                    current_desc_parts = [desc_part] if desc_part else []
+                    amt = trailing.group("amt")
+                    # Guard: treat as amount only if it looks like a real EUR number (has '.' or ',')
+                    if "." in amt or "," in amt:
+                        pending_amount = amt
+                        desc_part = rest[: trailing.start()].strip()
+                        current_desc_parts = [desc_part] if desc_part else []
+                    else:
+                        # Not a real amount (e.g., a page number or small integer) -> ignore as amount
+                        pending_amount = None
+                        current_desc_parts = [rest] if rest else []
                 else:
                     current_desc_parts = [rest] if rest else []
                     pending_amount = None
                 i += 1
                 continue
 
-            # Amount-only line => remember; do not emit yet
+            # Amount-only line => remember; require '.' or ',' so page numbers won't match
             mamt = RE_AMOUNT_ONLY.match(ln)
             if mamt and current_code is not None:
-                pending_amount = mamt.group("amt")
+                amt = mamt.group("amt")
+                if "." in amt or "," in amt:
+                    pending_amount = amt
+                # else: ignore (likely page number or stray integer)
                 i += 1
                 continue
 
@@ -267,4 +305,3 @@ def parse_pdf_filelike(file_like) -> pd.DataFrame:
             pass
     text = _pdf_to_text(file_like)
     return parse_pdf_text(text)
-
