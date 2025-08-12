@@ -74,10 +74,18 @@ def _extract_blocks(full_text: str) -> List[Dict[str, str]]:
     return blocks
 
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
+    """
+    Original working logic:
+      - Handle extra blank lines
+      - Grab whole tail after Spezifisches Ziel and split by '/'
+      - Works with 3-part and 4-part contexts
+    """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": None}
+
+    # Remove blank lines
     lines = [ln.strip() for ln in block_text.splitlines() if ln.strip()]
 
-    # find line with "Priorität"
+    # Find first "Priorität" line
     idx = None
     for i, ln in enumerate(lines):
         if "Priorität" in ln:
@@ -86,22 +94,26 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     if idx is None:
         return ctx
 
-    # merge current line + next line in case of breaks
+    # Merge current line with the next (handles rare breaks)
     merged = lines[idx]
     if idx + 1 < len(lines):
         merged += " / " + lines[idx + 1]
 
-    # split parts
+    # Split by '/'
     parts = [p.strip() for p in merged.split("/") if p.strip()]
+
     if len(parts) >= 2:
+        # Priorität
         prio_match = re.search(r"Priorität\s+(.+)", parts[0], flags=re.IGNORECASE)
         if prio_match:
             ctx["Priorität"] = prio_match.group(1).strip()
 
+        # Spezifisches Ziel
         ziel_match = re.search(r"Spezifisches\s+Ziel\s+(.+)", parts[1], flags=re.IGNORECASE)
         if ziel_match:
             ctx["Spezifisches Ziel"] = ziel_match.group(1).strip()
 
+    # Funding / Scope
     if len(parts) >= 4:
         ctx["Funding Programme"] = parts[2]
         ctx["Scope"] = parts[3]
@@ -110,7 +122,6 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
         ctx["Scope"] = None
 
     return ctx
-
 
 def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[str, float]]]:
     rows: List[Dict[str, Union[str, float]]] = []
@@ -222,3 +233,4 @@ def parse_pdf_filelike(file_like) -> pd.DataFrame:
             pass
     text = _pdf_to_text(file_like)
     return parse_pdf_text(text)
+
