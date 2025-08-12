@@ -41,8 +41,9 @@ RE_DIMENSION = re.compile(r"^\s*Tabelle\s+\d+\s*:\s*Dimension\s+(?P<dimension>.+
 RE_TABLE_HEADER = re.compile(r"^\s*Code\s+Beschreibung\s+Betrag\s+\(EUR\)\s*$", flags=re.MULTILINE)
 
 RE_CODE_LINE = re.compile(r"^\s*(?P<code>\d{2,3})\s+(?P<rest>.+)$")
-RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$")
-RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$")
+# Allow optional " EUR" suffix and stray spaces
+RE_AMOUNT_ONLY = re.compile(r"^\s*(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
+RE_AMOUNT_TRAILING = re.compile(r"(?P<amt>\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR)?\s*$")
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -82,15 +83,12 @@ def _split_parts_by_slash(s: str) -> List[str]:
 def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     """
     Robustly capture context:
-      - No single-char regex groups for Funding/Scope (prevents truncation).
-      - Split by '/'.
-      - Only stitch in next line if the first line has < 3 parts AND next line
-        is not clearly the start of the next section/table.
-      - Returns Scope="" when missing (3-part case).
+      - Split by '/'
+      - Only stitch next line if needed
+      - Scope = "" when missing (3-part case)
     """
     ctx = {"Priorität": None, "Spezifisches Ziel": None, "Funding Programme": None, "Scope": ""}
 
-    # Non-empty lines, with NBSP normalised
     lines = [ln.strip().replace("\u00A0", " ") for ln in block_text.splitlines() if ln.strip()]
 
     # Find the first line containing "Priorität"
@@ -105,7 +103,7 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
     candidate = lines[idx]
     parts = _split_parts_by_slash(candidate)
 
-    # Only stitch the next line if we still have <3 parts and the next line looks like a continuation
+    # Stitch next line if we still have <3 parts and the next line looks like continuation
     if len(parts) < 3 and idx + 1 < len(lines):
         nxt = lines[idx + 1]
         if not re.match(r"^(Tabelle|Dimension|Code)\b", nxt):
@@ -131,6 +129,37 @@ def _extract_context(block_text: str) -> Dict[str, Optional[str]]:
 
     return ctx
 
+# --- Description stitching ----------------------------------------------------
+
+def _join_desc_parts(parts: List[str]) -> str:
+    """
+    Join wrapped Beschreibung lines, fixing common hyphenation cases.
+    Rules:
+      - If previous line ends with '-' (soft hyphenation), join without space.
+      - Otherwise, join with single space.
+      - Collapse multiple spaces.
+    """
+    if not parts:
+        return ""
+    out = parts[0].strip()
+    for nxt in parts[1:]:
+        nxt = nxt.strip()
+        if not nxt:
+            continue
+        if out.endswith("-"):
+            # remove trailing '-' and join directly
+            out = out[:-1] + nxt
+        else:
+            out = f"{out} {nxt}"
+    # normalise whitespace
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out
+
+def _looks_like_new_table_marker(s: str) -> bool:
+    return bool(re.match(r"^\s*(Tabelle\s+\d+|Dimension\s+\d+|Code\s+Beschreibung\s+Betrag)", s))
+
+# --- Row extraction -----------------------------------------------------------
+
 def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[str, float]]]:
     rows: List[Dict[str, Union[str, float]]] = []
     ctx = _extract_context(block_text)
@@ -139,16 +168,6 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
     for dim_match in RE_DIMENSION.finditer(block_text):
         dim_start = dim_match.end()
         dimension_label = dim_match.group("dimension").strip()
-        # Grab continuation lines until stop condition
-        continuation_lines = []
-        for extra_line in block_text[dim_start:].splitlines()[0:]:
-            if not extra_line.strip():
-                break
-            if extra_line.strip().startswith("Code") or extra_line.strip().startswith("Tabelle"):
-                break
-            continuation_lines.append(extra_line.strip())
-        if continuation_lines:
-            dimension_label += " " + " ".join(continuation_lines)
 
         next_dim = RE_DIMENSION.search(block_text, pos=dim_start)
         local_end = next_dim.start() if next_dim else len(block_text)
@@ -170,7 +189,7 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
             nonlocal current_code, current_desc_parts
             if current_code is None:
                 return
-            desc = " ".join(p.strip() for p in current_desc_parts if p.strip())
+            desc = _join_desc_parts(current_desc_parts)
             amt_val = _norm_amount(amount_str)
             row = {
                 "Indikative Aufschlüsselung (Section)": section_id,
@@ -190,11 +209,13 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
         while i < len(lines):
             ln = lines[i]
 
+            # Start of a new code row?
             mcode = RE_CODE_LINE.match(ln)
             if mcode:
                 current_code = mcode.group("code")
                 rest = mcode.group("rest").strip()
 
+                # Same-line amount?
                 trailing = RE_AMOUNT_TRAILING.search(rest)
                 if trailing:
                     amt = trailing.group("amt")
@@ -206,12 +227,22 @@ def _rows_from_block(section_id: str, block_text: str) -> List[Dict[str, Union[s
                 i += 1
                 continue
 
+            # Amount-only line closes the row
             mamt = RE_AMOUNT_ONLY.match(ln)
             if mamt and current_code is not None:
                 emit_row(mamt.group("amt"))
                 i += 1
                 continue
 
+            # Guard: if we accidentally hit another table marker, end the row without amount
+            if _looks_like_new_table_marker(ln) and current_code is not None:
+                # no amount found; drop incomplete row to avoid corruption
+                current_code = None
+                current_desc_parts = []
+                i += 1
+                continue
+
+            # Otherwise it's a wrapped description line -> append
             if current_code is not None:
                 current_desc_parts.append(ln.strip())
             i += 1
