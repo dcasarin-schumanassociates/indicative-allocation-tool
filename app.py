@@ -33,7 +33,7 @@ def _parse_many(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> p
     all_rows = []
     for f in files:
         try:
-            df = parse_pdf_filelike(f, source_name=f.name)
+            df = parse_pdf_filelike(f)
             if df is not None and not df.empty:
                 all_rows.append(df)
         except Exception as e:
@@ -55,7 +55,6 @@ if parse_clicked:
         st.subheader("Preview & Select")
         st.write("Use the **Keep** column to select rows for export. You can sort and filter as needed.")
 
-        # Interactive editor with a checkbox column
         edited = st.data_editor(
             df,
             use_container_width=True,
